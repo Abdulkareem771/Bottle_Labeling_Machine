@@ -12,8 +12,8 @@ void setup()
   pinMode(STEP_PIN,OUTPUT);
   pinMode(DIR_PIN,OUTPUT);
 
-pinMode(START_SENSOR, INPUT_PULLUP);
-pinMode(STOP_SENSOR, INPUT_PULLUP);
+pinMode(START_SENSOR, INPUT);
+pinMode(STOP_SENSOR, INPUT);
 
     Serial.begin(9600);
 
