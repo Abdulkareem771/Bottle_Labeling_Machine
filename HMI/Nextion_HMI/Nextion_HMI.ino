@@ -1,180 +1,155 @@
 #include <EEPROM.h>
 
-// =======================
-// Driver Pins (PORT Manipulation)
-// =======================
-#define STEP_BIT 1   // PORTB1 = Pin 9
-#define DIR_BIT  0   // PORTB0 = Pin 8
-
+// Pins
+#define STEP_BIT 1   // Pin 9
+#define DIR_BIT  0   // Pin 8
 #define START_SENSOR_PIN 7
-#define STOP_SENSOR_PIN  6
+#define STOP_SENSOR_PIN  2 
 
-// =======================
-// Machine Parameters
-// =======================
-long maxStepsPerCycle = 1500;  // Safety limit
-int extraStepsAfterStop = 80;  // Dispense margin (Adjustable via HMI)
-volatile int pulseDelay = 350; // Motor speed
+// EEPROM Addresses
+#define ADDR_MARGIN 0  
+#define ADDR_SPEED  4  
+#define ADDR_LIMIT  8  
+#define ADDR_DELAY  12 
+#define ADDR_COUNT  16 
 
-// Timer & Motor Variables
+// Global Variables
+long maxStepsPerCycle = 1500;
+int extraStepsAfterStop = 80;
+volatile int pulseDelay = 350;
+int startDelayMs = 0;
+long batchCount = 0;
+
 volatile long stepsCount = 0;
 volatile bool motorRunning = false;
+volatile long lastStopStep = 0;
+volatile bool stopSensorTriggered = false;
 
-// State Machine
-enum MachineState { IDLE, MOVING, WAIT_RELEASE };
-MachineState state = IDLE;
-long lastStopStep = 0;
-bool stopSensorTriggered = false;
+enum SystemState { STATE_OFF, STATE_AUTO_WAIT_BOTTLE, STATE_AUTO_WAIT_DELAY, 
+                   STATE_AUTO_DISPENSING, STATE_AUTO_WAIT_BOTTLE_CLEAR, STATE_JOG_DISPENSING };
+SystemState state = STATE_OFF;
+SystemState lastState = STATE_OFF;
+unsigned long delayStartTime = 0;
 
-// =======================
-// Timer Setup (Non-blocking Stepper)
-// =======================
+// Interrupt
+void gapSensorISR() {
+  if ((state == STATE_AUTO_DISPENSING || state == STATE_JOG_DISPENSING) && stepsCount > 300) {
+    if (!stopSensorTriggered) { lastStopStep = stepsCount; stopSensorTriggered = true; }
+  }
+}
+
+// HMI Updates
+void updateHMI(String msg) {
+  Serial.print("page0.t0.txt=\"" + msg + "\"");
+  Serial.write(0xFF); Serial.write(0xFF); Serial.write(0xFF);
+}
+
+void updateBatchCount() {
+  Serial.print("page0.t3.val=" + String(batchCount));
+  Serial.write(0xFF); Serial.write(0xFF); Serial.write(0xFF);
+}
+
+// Timer Logic
 void setupTimer1() {
-  cli();
-  TCCR1A = 0;
-  TCCR1B = 0;
-  TCCR1B |= (1 << WGM12); // CTC Mode
-  TCCR1B |= (1 << CS10);  // Prescaler = 1 (16MHz)
-  OCR1B = 32 - 1;         // Fixed pulse width
-  TIMSK1 = 0;
-  sei();
+  cli(); TCCR1A = 0; TCCR1B = 0;
+  TCCR1B |= (1 << WGM12); TCCR1B |= (1 << CS10);
+  OCR1B = 32 - 1; TIMSK1 = 0; sei();
 }
 
 void startMotor() {
-  stepsCount = 0;
-  motorRunning = true;
-  TCNT1 = 0;
-  OCR1A = (pulseDelay * 16) - 1; 
-  TIMSK1 |= (1 << OCIE1A);
+  stepsCount = 0; motorRunning = true; TCNT1 = 0;
+  OCR1A = (pulseDelay * 16) - 1; TIMSK1 |= (1 << OCIE1A);
 }
 
 void stopMotor() {
-  motorRunning = false;
-  TIMSK1 = 0;
+  motorRunning = false; TIMSK1 = 0;
   PORTB &= ~(1 << STEP_BIT);
 }
 
 ISR(TIMER1_COMPA_vect) {
   if (!motorRunning) return;
-  PORTB |= (1 << STEP_BIT);
-  stepsCount++;
+  PORTB |= (1 << STEP_BIT); stepsCount++;
   TIMSK1 |= (1 << OCIE1B);
 }
 
 ISR(TIMER1_COMPB_vect) {
-  PORTB &= ~(1 << STEP_BIT);
-  TIMSK1 &= ~(1 << OCIE1B);
+  PORTB &= ~(1 << STEP_BIT); TIMSK1 &= ~(1 << OCIE1B);
 }
 
-// =======================
-// HMI Command Parser
-// =======================
+// Main logic
 void processHMIData() {
-  if (Serial.available()) {
-    String rxString = Serial.readStringUntil('\n');
-    rxString.trim(); // Clean up hidden characters
-    
-    if (rxString.length() == 0) return;
+  if (!Serial.available()) return;
+  String rx = Serial.readStringUntil('\n'); rx.trim();
+  if (rx.length() == 0) return;
 
-    if (rxString == "CMD:START") {
-      Serial.println("HMI: Operator pressed START");
-      if (state == IDLE) {
-        stopSensorTriggered = false;
-        startMotor();
-        state = MOVING;
-      }
-    } 
-    else if (rxString == "CMD:STOP") {
-      Serial.println("HMI: Operator pressed STOP (E-STOP)");
-      stopMotor();
-      state = IDLE;
-    }
-    else if (rxString.startsWith("SET:MARGIN,")) {
-      // Extract the number after the comma
-      String valString = rxString.substring(11);
-      extraStepsAfterStop = valString.toInt();
-      
-      Serial.print("HMI: Dispense Margin updated to -> ");
-      Serial.println(extraStepsAfterStop);
-      
-      // Save to EEPROM Address 0 so it survives reboots
-      EEPROM.put(0, extraStepsAfterStop); 
-    }
-  }
-}
-
-// =======================
-// Setup
-// =======================
-void setup() {
-  DDRB |= (1 << STEP_BIT);
-  DDRB |= (1 << DIR_BIT);
-  PORTB |= (1 << DIR_BIT); // Fixed direction
-
-  pinMode(START_SENSOR_PIN, INPUT);
-  pinMode(STOP_SENSOR_PIN, INPUT);
-
-  // Hardware Serial handles BOTH HMI communication and debugging now
-  Serial.begin(9600); 
+  if (rx == "CMD:START") { if (state == STATE_OFF) state = STATE_AUTO_WAIT_BOTTLE; }
+  else if (rx == "CMD:STOP") { stopMotor(); state = STATE_OFF; }
+  else if (rx == "CMD:JOG") { if (state == STATE_OFF) { stopSensorTriggered = false; startMotor(); state = STATE_JOG_DISPENSING; } }
+  else if (rx == "CMD:RESET_COUNT") { batchCount = 0; updateBatchCount(); EEPROM.put(ADDR_COUNT, batchCount); }
   
-  // Load saved margin from EEPROM
-  EEPROM.get(0, extraStepsAfterStop);
-  if (extraStepsAfterStop < 0 || extraStepsAfterStop > 500) {
-    extraStepsAfterStop = 80; // Default fallback if EEPROM is uninitialized
+  // Dirty Check Saves
+  else if (rx.startsWith("SET:MARGIN,")) {
+    int v = rx.substring(11).toInt();
+    if(v != extraStepsAfterStop) { extraStepsAfterStop = v; EEPROM.put(ADDR_MARGIN, extraStepsAfterStop); }
   }
-
-  setupTimer1();
-  Serial.println("Machine Initialized. Waiting for HMI...");
+  else if (rx.startsWith("SET:SPEED,")) {
+    int v = rx.substring(10).toInt();
+    if(v != pulseDelay) { pulseDelay = v; EEPROM.put(ADDR_SPEED, pulseDelay); }
+  }
+  else if (rx.startsWith("SET:DELAY,")) {
+    int v = rx.substring(10).toInt();
+    if(v != startDelayMs) { startDelayMs = v; EEPROM.put(ADDR_DELAY, startDelayMs); }
+  }
 }
 
-// =======================
-// Main Loop
-// =======================
+void setup() {
+  DDRB |= (1 << STEP_BIT) | (1 << DIR_BIT); PORTB |= (1 << DIR_BIT);
+  pinMode(START_SENSOR_PIN, INPUT); pinMode(STOP_SENSOR_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(STOP_SENSOR_PIN), gapSensorISR, RISING);
+  Serial.begin(9600);
+  EEPROM.get(ADDR_MARGIN, extraStepsAfterStop);
+  EEPROM.get(ADDR_SPEED, pulseDelay);
+  EEPROM.get(ADDR_DELAY, startDelayMs);
+  EEPROM.get(ADDR_COUNT, batchCount);
+  setupTimer1();
+}
+
 void loop() {
-  // 1. Always check the display for new operator commands
   processHMIData();
+  
+  // State Change HMI update
+  if (state != lastState) {
+    if (state == STATE_OFF) updateHMI("IDLE");
+    else if (state == STATE_AUTO_WAIT_BOTTLE) updateHMI("ARMED");
+    lastState = state;
+  }
 
-  // 2. Run the Machine Logic
   switch (state) {
-    case IDLE:
-      // Physical start sensor check
-      if (digitalRead(START_SENSOR_PIN) == HIGH && digitalRead(STOP_SENSOR_PIN) == LOW) {
-        stopSensorTriggered = false;
-        startMotor();
-        state = MOVING;
-        Serial.println("Cycle Started (Sensor Triggered)");
+    case STATE_AUTO_WAIT_BOTTLE:
+      if (digitalRead(START_SENSOR_PIN) == HIGH) {
+        if (startDelayMs > 0) { delayStartTime = millis(); state = STATE_AUTO_WAIT_DELAY; }
+        else { stopSensorTriggered = false; startMotor(); state = STATE_AUTO_DISPENSING; }
       }
       break;
 
-    case MOVING: {
-      cli(); long currentStep = stepsCount; sei();
-
-      // Look for the gap sensor
-      if (!stopSensorTriggered && digitalRead(STOP_SENSOR_PIN) == HIGH) {
-        stopSensorTriggered = true;
-        cli(); lastStopStep = stepsCount; sei();
-        Serial.print("Gap Detected at step: ");
-        Serial.println(lastStopStep);
+    case STATE_AUTO_WAIT_DELAY:
+      if (millis() - delayStartTime >= startDelayMs) {
+        stopSensorTriggered = false; startMotor(); state = STATE_AUTO_DISPENSING;
       }
+      break;
 
-      // Calculate if we have finished the extra dispense steps
-      bool extraDone = stopSensorTriggered && ((currentStep - lastStopStep) >= extraStepsAfterStop);
-      bool overLimit = (currentStep >= maxStepsPerCycle);
-
-      if (extraDone || overLimit) {
+    case STATE_AUTO_DISPENSING:
+    case STATE_JOG_DISPENSING:
+      if (stopSensorTriggered && (stepsCount - lastStopStep) >= extraStepsAfterStop) {
         stopMotor();
-        state = WAIT_RELEASE;
-        if (overLimit) Serial.println("ERROR: Max steps reached! Gap not found.");
-        else Serial.println("Cycle Complete.");
+        if (state == STATE_AUTO_DISPENSING) { batchCount++; updateBatchCount(); EEPROM.put(ADDR_COUNT, batchCount); state = STATE_AUTO_WAIT_BOTTLE_CLEAR; }
+        else state = STATE_OFF;
       }
+      if (stepsCount >= maxStepsPerCycle) { stopMotor(); state = STATE_OFF; }
       break;
-    }
 
-    case WAIT_RELEASE:
-      // Wait for the bottle to clear the sensor before resetting
-      if (digitalRead(START_SENSOR_PIN) == LOW) {
-        state = IDLE;
-      }
+    case STATE_AUTO_WAIT_BOTTLE_CLEAR:
+      if (digitalRead(START_SENSOR_PIN) == LOW) state = STATE_AUTO_WAIT_BOTTLE;
       break;
   }
 }
